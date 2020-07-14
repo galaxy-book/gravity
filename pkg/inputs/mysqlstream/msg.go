@@ -30,6 +30,7 @@ const (
 	ddl              binlogOp = "ddl"
 	xid              binlogOp = "xid"
 	barrier          binlogOp = "barrier"
+	heartbeat        binlogOp = "heartbeat"
 )
 
 type inputContext struct {
@@ -83,7 +84,7 @@ func NewInsertMsgs(
 		dmlMsg.Data = data
 		pks, err := mysql.GenPrimaryKeys(pkColumns, data)
 		if err != nil {
-			return nil, errors.Trace(err)
+			return nil, errors.Annotatef(err, "database: %s, table: %s", database, table)
 		}
 		dmlMsg.Pks = pks
 		msg.DmlMsg = dmlMsg
@@ -154,7 +155,7 @@ func NewUpdateMsgs(
 			dmlMsg.Operation = core.Update
 			pks, err := mysql.GenPrimaryKeys(pkColumns, data)
 			if err != nil {
-				return nil, errors.Trace(err)
+				return nil, errors.Annotatef(err, "database: %s, table: %s", database, table)
 			}
 			dmlMsg.Pks = pks
 
@@ -184,7 +185,7 @@ func NewUpdateMsgs(
 
 			pks, err := mysql.GenPrimaryKeys(pkColumns, old)
 			if err != nil {
-				return nil, errors.Trace(err)
+				return nil, errors.Annotatef(err, "database: %s, table: %s", database, table)
 			}
 			dmlMsg1.Pks = pks
 			dmlMsg1.Data = old
@@ -211,7 +212,7 @@ func NewUpdateMsgs(
 
 			pks, err = mysql.GenPrimaryKeys(pkColumns, data)
 			if err != nil {
-				return nil, errors.Trace(err)
+				return nil, errors.Annotatef(err, "database: %s, table: %s", database, table)
 			}
 			dmlMsg2.Pks = pks
 
@@ -315,7 +316,7 @@ func NewDeleteMsgs(
 		dmlMsg.Data = data
 		pks, err := mysql.GenPrimaryKeys(pkColumns, data)
 		if err != nil {
-			return nil, errors.Trace(err)
+			return nil, errors.Annotatef(err, "database: %s, table: %s", database, table)
 		}
 
 		dmlMsg.Pks = pks
@@ -361,6 +362,20 @@ func NewBarrierMsg(callback core.MsgCallbackFunc) *core.Msg {
 		Timestamp:           time.Now(),
 		Done:                make(chan struct{}),
 		InputContext:        inputContext{op: barrier},
+		InputStreamKey:      utils.NewStringPtr(inputStreamKey),
+		AfterCommitCallback: callback,
+		Phase: core.Phase{
+			Start: time.Now(),
+		},
+	}
+}
+
+func NewHeartbeatMsg(callback core.MsgCallbackFunc) *core.Msg {
+	return &core.Msg{
+		Type:                core.MsgCtl,
+		Timestamp:           time.Now(),
+		Done:                make(chan struct{}),
+		InputContext:        inputContext{op: heartbeat},
 		InputStreamKey:      utils.NewStringPtr(inputStreamKey),
 		AfterCommitCallback: callback,
 		Phase: core.Phase{

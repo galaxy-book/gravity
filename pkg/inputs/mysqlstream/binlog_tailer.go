@@ -89,7 +89,7 @@ func NewBinlogTailer(
 		parser:          parser.New(),
 		ctx:             c,
 		cancel:          cancel,
-		binlogSyncer:    utils.NewBinlogSyncer(gravityServerID, cfg.Source),
+		binlogSyncer:    utils.NewBinlogSyncer(gravityServerID, cfg.Source, cfg.HeartbeatPeriod),
 		emitter:         emitter,
 		router:          router,
 		positionCache:   positionCache,
@@ -264,6 +264,11 @@ func (tailer *BinlogTailer) Start() error {
 
 				schemaName, tableName := string(ev.Table.Schema), string(ev.Table.Table)
 
+				if schemaName == "mysql" {
+					log.Debugf("ignore change from mysql, table=%s", tableName)
+					continue
+				}
+
 				// dead signal is received from special internal table.
 				// it is only used for test purpose right now.
 				isDeadSignal := mysql_test.IsDeadSignal(schemaName, tableName)
@@ -309,11 +314,20 @@ func (tailer *BinlogTailer) Start() error {
 					}
 				}
 
+				// do not send messages without router to the system
+				if !consts.IsInternalDBTraffic(schemaName) &&
+					tailer.router != nil &&
+					!tailer.router.Exists(&core.Msg{
+						Database: schemaName,
+						Table:    tableName,
+					}) {
+					continue
+				}
+
 				// TODO: introduce schema store, so that we won't have stale schema
 				schema, err := tailer.sourceSchemaStore.GetSchema(schemaName)
 				if err != nil {
-					log.Errorf("[binlogTailer] failed GetSchema %v. err: %v.", schemaName, errors.ErrorStack(err))
-					continue
+					log.Fatalf("[binlogTailer] failed GetSchema %v. err: %v.", schemaName, errors.ErrorStack(err))
 				}
 
 				tableDef := schema[tableName]
@@ -324,7 +338,7 @@ func (tailer *BinlogTailer) Start() error {
 						log.Fatalf("[binlogTailer] failed to get internal traffic table: schemaName: %v, tableName: %v",
 							schemaName, tableName)
 					} else {
-						log.Errorf("[binlogTailer] failed to get table def, schemaName: %v, tableName: %v", schemaName, tableName)
+						log.Warnf("[binlogTailer] failed to get table def, skip this mutation. schemaName: %v, tableName: %v", schemaName, tableName)
 						continue
 					}
 				}
@@ -398,6 +412,11 @@ func (tailer *BinlogTailer) Start() error {
 					continue
 				}
 
+				// ignore savepoint
+				if strings.HasPrefix(ddlSQL, "SAVEPOINT") {
+					continue
+				}
+
 				//
 				// Once we have extracted the schema, we should always invalidate the schema cache unless the
 				// schema is from MySQL's internal schema.
@@ -421,6 +440,8 @@ func (tailer *BinlogTailer) Start() error {
 				if err := tailer.positionCache.Flush(); err != nil {
 					log.Fatalf("[binlogTailer] failed to flush position cache, err: %v", errors.ErrorStack(err))
 				}
+
+				sent := 0
 
 				for i := range dbNames {
 					dbName := dbNames[i]
@@ -459,23 +480,34 @@ func (tailer *BinlogTailer) Start() error {
 						ddlSQL,
 						int64(e.Header.Timestamp),
 						received)
+
+					// do not send messages without router to the system
+					if consts.IsInternalDBTraffic(dbName) ||
+						(tailer.router != nil && !tailer.router.Exists(ddlMsg)) {
+						continue
+					}
+
 					if err := tailer.emitter.Emit(ddlMsg); err != nil {
 						log.Fatalf("failed to emit ddl msg: %v", errors.ErrorStack(err))
 					}
+					sent++
 				}
 
-				// emit barrier msg
-				barrierMsg = NewBarrierMsg(tailer.AfterMsgCommit)
-				barrierMsg.InputContext = inputContext{op: ddl, position: currentPosition}
-				if err := tailer.emitter.Emit(barrierMsg); err != nil {
-					log.Fatalf("failed to emit barrier msg: %v", errors.ErrorStack(err))
-				}
-				<-barrierMsg.Done
-				if err := tailer.positionCache.Flush(); err != nil {
-					log.Fatalf("[binlogTailer] failed to flush position cache, err: %v", errors.ErrorStack(err))
+				if sent > 0 {
+					// emit barrier msg
+					barrierMsg = NewBarrierMsg(tailer.AfterMsgCommit)
+					barrierMsg.InputContext = inputContext{op: ddl, position: currentPosition}
+					if err := tailer.emitter.Emit(barrierMsg); err != nil {
+						log.Fatalf("failed to emit barrier msg: %v", errors.ErrorStack(err))
+					}
+					<-barrierMsg.Done
+					if err := tailer.positionCache.Flush(); err != nil {
+						log.Fatalf("[binlogTailer] failed to flush position cache, err: %v", errors.ErrorStack(err))
+					}
+
+					log.Infof("[binlogTailer] ddl done with gtid: %v, stmt: %s", ev.GSet.String(), string(ev.Query))
 				}
 
-				log.Infof("[binlogTailer] ddl done with gtid: %v", ev.GSet.String())
 			case *replication.GTIDEvent:
 				// GTID stands for Global Transaction IDentifier
 				// It is composed of two parts:
@@ -591,13 +623,6 @@ func (tailer *BinlogTailer) AppendMsgTxnBuffer(msg *core.Msg) {
 		c = metrics.InputCounter.WithLabelValues(env.PipelineName, msg.Database, msg.Table, string(msg.Type), "")
 	}
 	c.Add(1)
-	// do not send messages without router to the system
-	if !consts.IsInternalDBTraffic(msg.Database) &&
-		msg.Type != core.MsgCtl &&
-		tailer.router != nil &&
-		!tailer.router.Exists(msg) {
-		return
-	}
 	tailer.msgTxnBuffer = append(tailer.msgTxnBuffer, msg)
 	metrics.QueueLength.WithLabelValues(tailer.pipelineName, "input-buffer", "").Set(float64(len(tailer.msgTxnBuffer)))
 
@@ -607,6 +632,12 @@ func (tailer *BinlogTailer) AppendMsgTxnBuffer(msg *core.Msg) {
 	if len(tailer.msgTxnBuffer) >= config.TxnBufferLimit {
 		tailer.FlushMsgTxnBuffer()
 		tailer.ClearMsgTxnBuffer()
+
+		// send heartbeat to prevent sliding window timeout
+		heartbeat := NewHeartbeatMsg(tailer.AfterMsgCommit)
+		if err := tailer.emitter.Emit(heartbeat); err != nil {
+			log.Fatalf("failed to emit heartbeat msg: %v", errors.ErrorStack(err))
+		}
 	}
 }
 
@@ -679,7 +710,7 @@ func (tailer *BinlogTailer) getBinlogStreamer(gtid string) (*replication.BinlogS
 
 func (tailer *BinlogTailer) reopenBinlogSyncer(gtidString string) (*replication.BinlogStreamer, error) {
 	tailer.binlogSyncer.Close()
-	tailer.binlogSyncer = utils.NewBinlogSyncer(tailer.gravityServerID, tailer.cfg.Source)
+	tailer.binlogSyncer = utils.NewBinlogSyncer(tailer.gravityServerID, tailer.cfg.Source, tailer.cfg.HeartbeatPeriod)
 	return tailer.getBinlogStreamer(gtidString)
 }
 
